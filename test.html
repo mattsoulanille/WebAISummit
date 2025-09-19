@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>TensorFlow.js Model Training</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+  <script src="https://www.espruino.com/js/uart.js"></script>
+</head>
+<body>
+
+<pre>
+Tensorflow training test
+========================
+
+Usage:
+
+* Click 'Connect'
+* Choose 'Wave' from the Gesture list
+* Wave the hand with the Bangle on, then stop (Gesture should be shown below)
+* do it again, 5 times
+* Choose 'Clap' from the Gesture list
+* Clap your hands then wait
+* do it again, 5 times
+* Choose 'Shake' from the Gesture list
+* Shake your hand then wait
+* Change 'Gesture' to 'None' (so no new gestures are recorded)
+* Click 'Train'
+* Now make a gesture and see if it's predicted properly!
+
+
+
+</pre>
+
+<button id="btn_getgesture">Connect</button><br/>
+Gesture:
+<select id="gesturetype">
+  <option value="-1">None</option>
+  <option value="0">Wave</option>
+  <option value="1">Clap</option>
+  <option value="2">Shake Hand</option>
+</select>
+  
+<pre id="status">
+</pre>
+
+<button id="btn_clear">Clear Gestures</button>
+<button id="btn_train">Train!</button>
+
+  <script>
+// Set up UART.js for only Bluetooth
+UART.ports = UART.ports.filter(e => e.includes("Bluetooth")); // all watches are Bluetooth
+UART.timeoutMax = 200; // Ensure .write returns quickly even when the Bangle is sending data constantly
+// If "?dev=Bangle.js abcd" specified in URL, filter by that name
+if (window.location.search) {
+  let searchParams = new URLSearchParams(window.location.search);
+  if (searchParams.has("dev"))
+    UART.optionsBluetooth.filters=[{name:searchParams.get("dev")}];
+}
+
+const TF_INPUTS = 150;
+const TF_OUTPUTS = 3;
+let gestures = {
+  0 : [],
+  1 : [],
+  2 : [],
+};
+let model;
+
+if (window.localStorage.getItem("GESTURES")!==null) {
+  try {
+    gestures = JSON.parse(window.localStorage.getItem("GESTURES"));
+  } catch (e) {
+    console.log("Gesture load failed");
+  }
+}
+function saveGestures() {
+  window.localStorage.setItem("GESTURES", JSON.stringify(gestures));
+}
+function getGestureState() {
+  return Object.keys(gestures).map(g=>g+"=>"+gestures[g].length).join(",");
+}
+
+function setStatus(txt) {
+  document.getElementById("status").innerText = txt;
+}
+
+setStatus("Gestures: "+getGestureState());
+
+function onLine(l) {
+  console.log("BT> Got line:", l);
+  let json = UART.parseRJSON(l);
+  if (json && json.t=="gesture") {
+    let currentGesture = parseInt(document.getElementById("gesturetype").value);
+    if (currentGesture>=0)
+      gestures[currentGesture].push(json.data);
+  
+    setStatus(getGestureState()+"\n"+
+       currentGesture+" => "+JSON.stringify(json));
+    if (model) makePrediction(json.data).then( prediction => setStatus("Prediction: " + prediction) );
+  }
+}
+
+document.getElementById("btn_getgesture").addEventListener("click", function() {
+  setStatus("Connecting");
+  UART.write(`\x10reset()\n`) // clear out everything currently running
+  .then(new Promise(resolve => setTimeout(resolve, 500))) // wait for a bit just to make sure
+  .then(() => UART.write(`\x10Bangle.on("gesture",e=>Bluetooth.println(E.toJS({t:"gesture", data:e})));Bluetooth.println();\n`)) // x,y,z,x,y,z,...
+  .then(function() {
+    let connection = UART.getConnection();
+    connection.removeListener("line", onLine); // remove any existing so we don't get duplicates
+    connection.on("line", onLine);
+    setStatus("Ready!");
+  });
+});
+document.getElementById("btn_clear").addEventListener("click", function() {
+  Object.keys(gestures).forEach(g => gestures[g] = []);
+  setStatus("Gestures: "+getGestureState());
+});
+document.getElementById("btn_train").addEventListener("click", function() {
+  setStatus("Training");
+  trainModel().then(() => {
+    setStatus("Finished!");
+  });
+});
+
+function dataToArray(data) {
+  var a = new Array(150);
+  for (var i=0;i<data.length;i++)
+    a[i] = data[i];
+  let endXYZ = data.length-3;
+  for (var i=data.length;i<a.length;i+=3) {
+    a[i+0] = a[endXYZ+0];
+    a[i+1] = a[endXYZ+1];
+    a[i+2] = a[endXYZ+2];
+  }
+  return a;
+}
+
+
+// A simple function to generate some dummy data for training
+function generateData() {
+  const inputs = [];
+  const outputs = [];
+  let numSamples = 0;
+
+  function addInputs(dataIn,dataOut) {
+    dataIn.forEach(data => {      
+      inputs.push(dataToArray(data));
+      outputs.push(dataOut);
+      numSamples++;
+    });
+  }
+
+  addInputs(gestures[0], [1,0,0]);
+  addInputs(gestures[1], [0,1,0]);
+  addInputs(gestures[2], [0,0,1]);
+
+  // Convert the arrays into TensorFlow.js Tensors
+  const inputTensor = tf.tensor2d(inputs, [numSamples, TF_INPUTS]);
+  const outputTensor = tf.tensor2d(outputs, [numSamples, TF_OUTPUTS]);
+
+  return { inputTensor, outputTensor };
+}
+
+// Main function to define, compile, and train the model
+async function trainModel() {
+  console.log('Starting model training...');
+
+  // Step 1: Define the model architecture
+  model = tf.sequential();
+  
+  // A dense layer is a fully connected neural network layer.
+  // We'll use a single dense layer to keep this example simple.
+  // The input shape must match the number of features in your data (150).
+  model.add(tf.layers.dense({ 
+    units: TF_OUTPUTS, // Number of output neurons
+    inputShape: [TF_INPUTS] // Number of input features
+  }));
+
+  // Step 2: Prepare the data
+  const { inputTensor, outputTensor } = generateData();
+
+  // Step 3: Compile the model
+  // We specify the optimizer, the loss function, and the metrics to track.
+  // The 'adam' optimizer is a good general-purpose optimizer.
+  // 'meanSquaredError' is a common loss function for regression problems.
+  model.compile({
+    optimizer: 'adam',
+    loss: 'meanSquaredError',
+    metrics: ['accuracy']
+  });
+
+  // Print a summary of the model architecture
+  model.summary();
+
+  // Step 4: Train the model
+  const epochs = 50; // Number of times to iterate over the entire dataset
+  console.log(`Training for ${epochs} epochs...`);
+
+  const history = await model.fit(inputTensor, outputTensor, {
+    epochs: epochs,
+    callbacks: {
+      onEpochEnd: (epoch, logs) => {
+        // Log the loss and accuracy at the end of each epoch
+        console.log(`Epoch ${epoch + 1}: Loss = ${logs.loss.toFixed(4)}, Accuracy = ${logs.acc.toFixed(4)}`);
+      }
+    }
+  });
+
+  console.log('Training complete!');
+
+  // Optional: Make a prediction with the trained model
+  const testData = tf.randomNormal([1, 150]); // Create a single random input
+  const prediction = model.predict(testData);
+
+  // Print the prediction to the console
+  prediction.print();
+
+  // Clean up Tensors to free up memory
+  inputTensor.dispose();
+  outputTensor.dispose();
+  testData.dispose();
+  prediction.dispose();
+}
+
+async function makePrediction(data) {
+  console.log('Making a prediction...');
+
+  // Step 1: Convert the JavaScript array to a 2D Tensor
+  // The shape [1, 150] indicates a single sample with 150 elements.
+  const inputTensor = tf.tensor2d([dataToArray(data)], [1, 150]);
+
+  // Step 2: Make the prediction using the model's predict method
+  // The result will be a Tensor.
+  const predictionTensor = model.predict(inputTensor);
+
+  // Step 3: Convert the prediction Tensor back to a JavaScript array
+  // The .dataSync() method is a synchronous way to get the data from the Tensor.
+  // Note: For large datasets or in production, consider .data() which is asynchronous.
+  const predictionArray = predictionTensor.dataSync();
+
+  // Log the results
+  console.log('Input data:', data);
+  console.log('Prediction results:', predictionArray);
+
+  // Clean up Tensors from memory
+  inputTensor.dispose();
+  predictionTensor.dispose();
+
+  return predictionArray;
+}
+
+  </script>
+</body>
+</html>
