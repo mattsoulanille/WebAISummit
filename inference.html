@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>TFLite Clapping Inference</title>
+  <script src="https://www.espruino.com/js/uart.js"></script>
+  <script type="importmap">
+  {
+    "imports": {
+      "@litertjs/core": "https://cdn.jsdelivr.net/npm/@litertjs/core/+esm"
+    }
+  }
+  </script>
+</head>
+<body style="font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; line-height: 1.6;">
+
+  <h2>Bangle.js Clapping Inference</h2>
+
+  <p>
+    Runs a TFLite model to detect clapping from live accelerometer data using LiteRT.js.
+  </p>
+
+  <ol>
+    <li>Click 'Select Model' and choose your <code>clap_model.tflite</code> file.</li>
+    <li>Click 'Connect' and pair with your Bangle.js watch.</li>
+    <li>Once connected, clap and watch the 'Prediction' value go near 1.0!</li>
+  </ol>
+
+  <hr>
+
+  <h3>Controls</h3>
+  <label for="model_input">TFLite Model:</label>
+  <input type="file" id="model_input" accept=".tflite">
+  <br/><br/>
+  <button id="btn_connect">Connect to Watch</button>
+  <button id="btn_stop_stream" style="display: none;">Stop Stream</button>
+
+  <h3>Status</h3>
+  <pre id="status">Select a model file.</pre>
+
+  <h3>Live Data</h3>
+  <pre id="data_out">...</pre>
+
+  <h3>Prediction</h3>
+  <pre id="prediction_out" style="font-size: 2em; font-weight: bold; color: #007bff;">-</pre>
+
+
+<script type="module">
+import { loadLiteRt, loadAndCompile, Tensor } from "@litertjs/core";
+
+// --- UART & Bluetooth Setup ---
+UART.ports = UART.ports.filter(e => e.includes("Bluetooth"));
+UART.timeoutMax = 200;
+if (window.location.search) {
+  let searchParams = new URLSearchParams(window.location.search);
+  if (searchParams.has("dev"))
+    UART.optionsBluetooth.filters = [{ name: searchParams.get("dev") }];
+}
+
+// --- Model & Data Constants ---
+const WINDOW_SIZE = 30;
+const NUM_CHANNELS = 4;  // x, y, z, magnitude
+
+// --- App State ---
+let dataBuffer = [];      // Holds the most recent WINDOW_SIZE samples for live prediction
+let model; // Will hold the compiled LiteRT model
+
+// --- DOM Elements ---
+const btnConnect = document.getElementById("btn_connect");
+const btnStopStream = document.getElementById("btn_stop_stream");
+const modelInput = document.getElementById("model_input");
+const preStatus = document.getElementById("status");
+const preDataOut = document.getElementById("data_out");
+const prePredictionOut = document.getElementById("prediction_out");
+
+// --- Utility Functions ---
+function setStatus(txt) {
+  preStatus.innerText = txt;
+}
+function setPrediction(txt) {
+  prePredictionOut.innerText = txt;
+}
+
+// --- LiteRT Initialization ---
+async function init() {
+    setStatus("Loading LiteRT engine...");
+    modelInput.disabled = true;
+    btnConnect.disabled = true;
+    try {
+        // Load the LiteRT WASM module from the CDN.
+        await loadLiteRt('https://cdn.jsdelivr.net/npm/@litertjs/core/wasm/');
+        setStatus("LiteRT engine loaded. Please select a model file.");
+        modelInput.disabled = false;
+    } catch (e) {
+        setStatus(`Failed to load LiteRT engine: ${e}`);
+        console.error(e);
+    }
+}
+init();
+
+
+// --- Model Loading ---
+modelInput.addEventListener('change', async (event) => {
+  const file = event.target.files[0];
+  if (!file) {
+    setStatus("Model loading cancelled.");
+    return;
+  }
+  setStatus("Loading and compiling model...");
+  btnConnect.disabled = true;
+  try {
+    const modelBuffer = await file.arrayBuffer();
+    if (model) {
+        model.delete(); // Clean up the old model if one exists
+    }
+    model = await loadAndCompile(new Uint8Array(modelBuffer), { accelerator: 'wasm' });
+    setStatus("Model loaded successfully. Ready to connect.");
+    btnConnect.disabled = false;
+  } catch (e) {
+    setStatus(`Model loading failed: ${e}`);
+    console.error(e);
+  }
+});
+
+
+// --- Bluetooth Data Handler ---
+async function onLine(l) {
+  let json = UART.parseRJSON(l);
+  if (json && json.t === "acc") {
+    // 1. Calculate Magnitude
+    const m = Math.sqrt(json.x * json.x + json.y * json.y + json.z * json.z);
+    const sample = [json.x, json.y, json.z, m];
+    preDataOut.innerText = `x: ${json.x.toFixed(2)}, y: ${json.y.toFixed(2)}, z: ${json.z.toFixed(2)}, m: ${m.toFixed(2)}`;
+
+    // 2. Add to data buffer for live prediction
+    dataBuffer.push(sample);
+    while (dataBuffer.length > WINDOW_SIZE) {
+      dataBuffer.shift(); // Keep buffer at exactly WINDOW_SIZE
+    }
+
+    // 3. Handle Prediction
+    if (model && dataBuffer.length === WINDOW_SIZE) {
+      await makePrediction(dataBuffer);
+    }
+  }
+}
+
+// --- UI Event Listeners ---
+btnConnect.addEventListener("click", function() {
+  if (!model) {
+    setStatus("Please select and load a model file first.");
+    return;
+  }
+  setStatus("Connecting...");
+  UART.write(`\x10reset()\n`) // Clear running code
+    .then(() => new Promise(resolve => setTimeout(resolve, 500)))
+    .then(() => UART.write(`\x10Bangle.setPollInterval(50); Bangle.on("accel",e=>Bluetooth.println(E.toJS({t:"acc", x:e.x, y:e.y, z:e.z})));Bluetooth.println();\n`)) // 50ms = 20Hz
+    .then(function() {
+      let connection = UART.getConnection();
+      connection.removeListener("line", onLine);
+      connection.on("line", onLine);
+      setStatus("Connected and streaming data.");
+      btnConnect.style.display = 'none';
+      btnStopStream.style.display = 'inline-block';
+    })
+    .catch(e => {
+      setStatus("Connection Failed: " + e);
+    });
+});
+
+btnStopStream.addEventListener("click", function() {
+  UART.write(`\x10load()\n`) // reload default (watch) app
+    .then(function() {
+      let connection = UART.getConnection();
+      connection.removeListener("line", onLine);
+      setStatus("Stopped.");
+      btnConnect.style.display = 'inline-block';
+      btnStopStream.style.display = 'none';
+    });
+});
+
+// --- LiteRT.js Inference Function ---
+async function makePrediction(data) {
+  // 1. Create input tensor
+  const flatInput = new Float32Array(data.flat());
+  const inputTensor = new Tensor(flatInput, [1, WINDOW_SIZE, NUM_CHANNELS]);
+
+  // 2. Run inference
+  const outputTensors = model.run(inputTensor);
+  const outputTensor = outputTensors[0];
+  const probability = outputTensor.toTypedArray()[0];
+
+  // 3. Display result
+  let label = probability > 0.5 ? "Clapping" : "Not Clapping";
+  setPrediction(`${label} (${probability.toFixed(3)})`);
+
+  // 4. Clean up tensors
+  inputTensor.delete();
+  outputTensors.forEach(t => t.delete());
+}
+
+</script>
+</body>
+</html>
