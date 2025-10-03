@@ -1,0 +1,5 @@
+.venv/
+clapping-data.json
+clap_model.tflite
+*~
+\#*\#
